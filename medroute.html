@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>MedRoute — динамическая маршрутизация СМП Махачкалы</title>
+<style>
+  :root { --bg:#0f1420; --panel:#1a2332; --accent:#2dd4bf; }
+  * { box-sizing:border-box; margin:0; font-family:'Segoe UI',system-ui,sans-serif; }
+  body { background:var(--bg); color:#e2e8f0; display:flex; height:100vh; }
+  #sidebar { width:340px; background:var(--panel); padding:20px; overflow-y:auto; flex-shrink:0; }
+  h1 { font-size:20px; color:var(--accent); margin-bottom:4px; }
+  .sub { font-size:12px; color:#94a3b8; margin-bottom:14px; }
+  .stats { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:12px 0; }
+  .stat { background:#243146; border-radius:8px; padding:8px 10px; }
+  .stat b { font-size:17px; display:block; color:var(--accent); }
+  .stat span { font-size:11px; color:#94a3b8; }
+  button { background:var(--accent); border:none; color:#04211d; padding:8px 14px;
+           border-radius:6px; font-weight:600; cursor:pointer; margin:4px 6px 4px 0; }
+  button.sec { background:#334155; color:#e2e8f0; }
+  input[type=range] { width:100%; }
+  select, input[type=number] { background:#243146; color:#e2e8f0; border:1px solid #334155;
+           border-radius:6px; padding:6px; width:100%; margin:4px 0; }
+  label { font-size:12px; color:#94a3b8; display:block; margin-top:10px; }
+  .legend { font-size:12px; margin-top:12px; line-height:1.8; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; }
+  #log { font-size:11px; color:#94a3b8; margin-top:12px; max-height:110px; overflow-y:auto;
+         border-top:1px solid #334155; padding-top:8px; }
+  table { width:100%; border-collapse:collapse; font-size:11px; margin-top:8px; }
+  th, td { padding:4px 6px; text-align:left; border-bottom:1px solid #334155; }
+  th { color:#94a3b8; font-weight:500; }
+  #chartBox { margin-top:12px; background:#0b1018; border-radius:8px; padding:6px; }
+  #chartBox .cap { font-size:11px; color:#94a3b8; margin-bottom:4px; }
+  #chart { width:100%; display:block; }
+  #insp { display:none; margin-top:12px; background:#243146; border-radius:8px;
+          padding:10px; font-size:12px; line-height:1.7; border-left:3px solid var(--accent); }
+  #insp b { color:var(--accent); }
+  .hint { font-size:11px; color:#64748b; margin-top:8px; }
+  .wrap { flex:1; display:flex; justify-content:center; align-items:center; }
+  canvas#cv { background:#0b1018; cursor:crosshair; }
+</style>
+</head>
+<body>
+<div id="sidebar">
+  <h1>🚑 MedRoute</h1>
+  <div class="sub">Мультиагентная маршрутизация СМП · Махачкала</div>
+
+  <button id="btnRun">Пауза</button>
+  <button id="btnReset" class="sec">Сброс</button>
+  <label>Интенсивность вызовов (выз./мин): <b id="lblRate">1.0</b></label>
+  <input type="range" id="rate" min="0.2" max="4" step="0.1" value="1">
+  <label>Всего бригад: <b id="lblCrew">16</b></label>
+  <input type="range" id="crews" min="8" max="40" step="2" value="16">
+
+  <label>Стратегия диспетчера</label>
+  <select id="strategy">
+    <option value="greedy">Жадная — ближайшая бригада</option>
+    <option value="smart">Умная — приоритет + патрулирование</option>
+  </select>
+  <label>Seed генератора вызовов</label>
+  <input type="number" id="seed" value="42">
+  <button id="btnRestart" class="sec">Перезапустить с seed</button>
+  <button id="btnRecord">Зафиксировать замер</button>
+  <button id="btnExport" class="sec">Экспорт CSV</button>
+
+  <div class="stats">
+    <div class="stat"><b id="sAvg">—</b><span>среднее время прибытия, мин</span></div>
+    <div class="stat"><b id="sP1">—</b><span>среднее время (приоритет 1)</span></div>
+    <div class="stat"><b id="sDone">0</b><span>обслужено вызовов</span></div>
+    <div class="stat"><b id="sBusy">0</b><span>занято бригад</span></div>
+  </div>
+
+  <table id="cmp">
+    <tr><th>Стратегия</th><th>Ср.</th><th>Ср. P1</th><th>N</th></tr>
+  </table>
+
+  <div id="chartBox">
+    <div class="cap">Среднее время прибытия vs интенсивность вызовов
+      <span style="color:#fbbf24">● жадная</span>
+      <span style="color:#2dd4bf">● умная</span>
+      (○ — приоритет 1)</div>
+    <canvas id="chart" width="300" height="130"></canvas>
+  </div>
+
+  <div id="insp"></div>
+  <div class="hint">Клик по карте — инспектор бригады или вызова.</div>
+
+  <div class="legend">
+    <span class="dot" style="background:#2dd4bf"></span>свободна / патрулирует<br>
+    <span class="dot" style="background:#fbbf24"></span>в пути к пациенту<br>
+    <span class="dot" style="background:#f87171"></span>доставка в больницу<br>
+    <span class="dot" style="background:#fff; width:14px;height:4px;border-radius:0"></span>критический вызов P1
+  </div>
+  <div id="log"></div>
+</div>
+<div class="wrap"><canvas id="cv"></canvas></div>
+
+<script>
+// ================= МОДЕЛЬ ГОРОДА =================
+const N = 60, CELL = 12, PX = N * CELL;
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+cv.width = PX; cv.height = PX;
+
+function fitCanvas() {
+  const w = cv.parentElement.clientWidth - 20, h = cv.parentElement.clientHeight - 20;
+  const scale = Math.min(w, h) / PX;
+  cv.style.height = (PX * scale) + 'px';
+  cv.style.width  = (PX * scale) + 'px';
+}
+window.addEventListener('resize', fitCanvas);
+
+const DISTRICTS = [
+  [0,0,22,59,'Ленинский'], [22,0,42,30,'Советский'], [22,30,42,59,'Кировский'],
+  [42,0,59,59,'Советский (юг)']
+];
+const HOSPITALS = [
+  [8, 10, 'РКБ №1', 4], [18, 45, 'ГКБ №2', 3],
+  [32, 18, 'ГКБ им. Качанова', 4], [48, 40, 'ЦГБ', 3], [40, 8, 'Детская ГКБ', 2]
+];
+
+const roads = new Set();
+for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+  if (x % 6 === 3 || y % 6 === 3) roads.add(x + ',' + y);
+  else if (x % 2 === 1 || y % 2 === 1) roads.add(x + ',' + y);
+}
+const isRoad = (x, y) => x >= 0 && y >= 0 && x < N && y < N && roads.has(x + ',' + y);
+
+// ================= ГЕНЕРАТОР С SEED =================
+// Одинаковый seed => одинаковая последовательность вызовов для обеих стратегий
+function mulberry32(a) {
+  return function() {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+let rng = mulberry32(42);
+
+// ================= АГЕНТЫ =================
+const STATE_RU = {
+  idle: 'свободна', toScene: 'в пути к пациенту', atScene: 'на месте вызова',
+  toHosp: 'доставка в больницу', reposition: 'патрулирование'
+};
+
+class Ambulance {
+  constructor(id, base) {
+    this.id = id; this.base = base;
+    this.x = base.x; this.y = base.y;
+    this.path = []; this.pos = 0;
+    this.state = 'idle';   // idle | toScene | atScene | toHosp | reposition
+    this.call = null; this.speed = 3.2;
+  }
+  assign(call) {
+    this.call = call; this.state = 'toScene';
+    this.path = aStar([Math.round(this.x), Math.round(this.y)], [call.x, call.y]);
+    this.pos = 0; call.status = 'assigned'; call.amb = this;
+  }
+  progress() { // % пройденного пути для инспектора
+    if (!this.path || this.path.length < 2) return 100;
+    return Math.min(100, Math.round(100 * this.pos / (this.path.length - 1)));
+  }
+  step(dt) {
+    if (this.state === 'idle' || this.state === 'atScene') return;
+    this.pos += this.speed * dt;
+    if (this.pos >= this.path.length - 1) {
+      const [gx, gy] = this.path[this.path.length - 1];
+      this.x = gx; this.y = gy; this.pos = 0;
+      if (this.state === 'toScene') {
+        this.state = 'atScene'; this.call.arrive = simTime; this.call.wait = 5;
+        const rt = simTime - this.call.created;
+        metrics.resp.push(rt);
+        if (this.call.pri === 1) metrics.resp1.push(rt);
+        log(`Бригада №${this.id} прибыла к вызову P${this.call.pri} за ${rt.toFixed(1)} мин`);
+      } else if (this.state === 'toHosp') {
+        this.state = 'idle'; this.call.status = 'done'; this.call = null; this.path = [];
+      } else { // reposition
+        this.state = 'idle'; this.path = [];
+      }
+    } else {
+      const p = this.path, i = Math.floor(this.pos), f = this.pos - i;
+      const a = p[i], b = p[Math.min(i + 1, p.length - 1)];
+      this.x = a[0] + (b[0] - a[0]) * f; this.y = a[1] + (b[1] - a[1]) * f;
+    }
+  }
+}
+
+class Call {
+  constructor(t) {
+    this.created = t; this.status = 'waiting'; this.amb = null; this.arrive = null;
+    const r = rng();
+    this.pri = r < 0.25 ? 1 : (r < 0.8 ? 2 : 3);
+    const d = DISTRICTS[Math.floor(rng() * DISTRICTS.length)];
+    do {
+      this.x = Math.round(d[0] + 2 + rng() * (d[2] - d[0] - 4));
+      this.y = Math.round(d[1] + 2 + rng() * (d[3] - d[1] - 4));
+    } while (!isRoad(this.x, this.y));
+    this.district = d[4];
+  }
+}
+
+// ================= ДИСПЕТЧЕР: ДВЕ СТРАТЕГИИ =================
+function freeAmbulances() {
+  return ambulances.filter(a => a.state === 'idle' || a.state === 'reposition');
+}
+
+function dispatchGreedy() {
+  const waiting = calls.filter(c => c.status === 'waiting')
+                       .sort((a, b) => a.pri - b.pri || a.created - b.created);
+  for (const call of waiting) {
+    let best = null, bt = Infinity;
+    for (const a of freeAmbulances()) {
+      const t = aStarLen([Math.round(a.x), Math.round(a.y)], [call.x, call.y]) / a.speed;
+      if (t < bt) { bt = t; best = a; }
+    }
+    if (best) best.assign(call);
+  }
+}
+
+function dispatchSmart() {
+  // Приоритет: критические первыми, внутри уровня — кто дольше ждёт.
+  // Выбор бригады: время пути + растущий штраф за ожидание.
+  const waiting = calls.filter(c => c.status === 'waiting')
+    .sort((a, b) => (b.pri * 100 - (simTime - b.created)) - (a.pri * 100 - (simTime - a.created)));
+  for (const call of waiting) {
+    const age = simTime - call.created;
+    let best = null, bc = Infinity;
+    for (const a of freeAmbulances()) {
+      const t = aStarLen([Math.round(a.x), Math.round(a.y)], [call.x, call.y]) / a.speed;
+      const cost = t + 0.3 * age;
+      if (cost < bc) { bc = cost; best = a; }
+    }
+    if (best) best.assign(call);
+  }
+}
+
+// Патрулирование: свободные бригады стягиваются к районам с ожидающими вызовами
+let nextReposition = 0;
+function reposition() {
+  const waiting = calls.filter(c => c.status === 'waiting');
+  for (const a of ambulances) {
+    if (a.state !== 'idle' && a.state !== 'reposition') continue;
+    let target = null, bd = Infinity;
+    for (const c of waiting) {
+      const d = Math.abs(Math.round(a.x) - c.x) + Math.abs(Math.round(a.y) - c.y);
+      if (d < bd) { bd = d; target = [c.x, c.y]; }
+    }
+    if (!target) target = [a.base.x, a.base.y];
+    if (target[0] !== Math.round(a.x) || target[1] !== Math.round(a.y)) {
+      a.state = 'reposition';
+      a.path = aStar([Math.round(a.x), Math.round(a.y)], target);
+      a.pos = 0;
+    }
+  }
+}
+
+// ================= A* =================
+function aStar(start, goal) {
+  const key = (x, y) => x + ',' + y;
+  const open = new Map(), closed = new Set();
+  const h = (x, y) => Math.abs(x - goal[0]) + Math.abs(y - goal[1]);
+  open.set(key(...start), { f: h(...start), g: 0, parent: null, x: start[0], y: start[1] });
+  while (open.size) {
+    let cur = null;
+    for (const n of open.values()) if (!cur || n.f < cur.f) cur = n;
+    if (cur.x === goal[0] && cur.y === goal[1]) {
+      const path = [];
+      for (let n = cur; n; n = n.parent) path.unshift([n.x, n.y]);
+      return path;
+    }
+    open.delete(key(cur.x, cur.y)); closed.add(key(cur.x, cur.y));
+    for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+      const nx = cur.x + dx, ny = cur.y + dy;
+      if (!isRoad(nx, ny) || closed.has(key(nx, ny))) continue;
+      const cost = (nx % 6 === 3 || ny % 6 === 3) ? 1 : 1.8;
+      const g = cur.g + cost, k = key(nx, ny);
+      if (!open.has(k) || open.get(k).g > g)
+        open.set(k, { f: g + h(nx, ny), g, parent: cur, x: nx, y: ny });
+    }
+  }
+  return [start, goal];
+}
+const aStarLen = (s, g) => Math.max(Math.abs(s[0]-g[0]) + Math.abs(s[1]-g[1]), 1);
+
+// ================= СИМУЛЯЦИЯ =================
+let ambulances = [], calls = [], running = true, simTime = 0, nextCall = 0;
+let metrics = { resp: [], resp1: [] };
+const logEl = document.getElementById('log');
+const log = m => { const d = document.createElement('div'); d.textContent = m; logEl.prepend(d); };
+
+// ================= ЭКСПЕРИМЕНТ: ЖУРНАЛ, ГРАФИК, CSV =================
+const records = []; // журнал всех замеров (переживает сбросы симуляции)
+
+const chart = document.getElementById('chart'), chCtx = chart.getContext('2d');
+const CW = chart.width, CH = chart.height;
+const COL = { greedy: '#fbbf24', smart: '#2dd4bf' };
+
+function drawChart() {
+  chCtx.fillStyle = '#0b1018'; chCtx.fillRect(0, 0, CW, CH);
+  const m = { l: 30, r: 10, t: 10, b: 20 };
+  if (!records.length) {
+    chCtx.fillStyle = '#64748b'; chCtx.font = '10px sans-serif';
+    chCtx.fillText('замеров пока нет — нажмите «Зафиксировать замер»', m.l, CH / 2);
+    return;
+  }
+  const maxX = 4.2;
+  const maxY = Math.max(6, ...records.map(r => Math.max(r.avg, r.avgP1 || 0))) * 1.15;
+  const gx = v => m.l + (v / maxX) * (CW - m.l - m.r);
+  const gy = v => CH - m.b - (v / maxY) * (CH - m.t - m.b);
+
+  // сетка и подписи осей
+  chCtx.strokeStyle = '#1e293b'; chCtx.lineWidth = 1;
+  chCtx.font = '8px sans-serif'; chCtx.fillStyle = '#64748b';
+  for (let v = 0; v <= 4; v += 1) {
+    chCtx.beginPath(); chCtx.moveTo(gx(v), m.t); chCtx.lineTo(gx(v), CH - m.b); chCtx.stroke();
+    chCtx.fillText(v, gx(v) - 3, CH - 8);
+  }
+  for (let i = 0; i <= 4; i++) {
+    const v = maxY * i / 4;
+    chCtx.beginPath(); chCtx.moveTo(m.l, gy(v)); chCtx.lineTo(CW - m.r, gy(v)); chCtx.stroke();
+    chCtx.fillText(v.toFixed(0), 4, gy(v) + 3);
+  }
+
+  for (const r of records) {
+    const x = gx(r.rate);
+    // сплошная точка — среднее по всем вызовам
+    chCtx.beginPath(); chCtx.arc(x, gy(r.avg), 3.5, 0, 7);
+    chCtx.fillStyle = COL[r.strategy]; chCtx.fill();
+    // кольцо — среднее по P1
+    if (r.avgP1 != null) {
+      chCtx.beginPath(); chCtx.arc(x, gy(r.avgP1), 3.5, 0, 7);
+      chCtx.strokeStyle = COL[r.strategy]; chCtx.lineWidth = 1.5; chCtx.stroke();
+    }
+  }
+}
+
+function exportCSV() {
+  if (!records.length) { log('Журнал пуст — сначала зафиксируйте замеры'); return; }
+  const rows = [['strategy','seed','rate_calls_per_min','crews','avg_min','avg_p1_min','n','sim_time_min']];
+  for (const r of records)
+    rows.push([r.strategy, r.seed, r.rate, r.crews, r.avg, r.avgP1 ?? '', r.n, Math.round(r.simTime)]);
+  const csv = rows.map(r => r.join(';')).join('\n');
+  const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'medroute_results.csv';
+  a.click();
+  log(`Экспортировано замеров: ${records.length}`);
+}
+
+// ================= ИНСПЕКТОР АГЕНТОВ =================
+let selected = null; // { type: 'amb' | 'call', obj }
+
+cv.addEventListener('click', e => {
+  const rect = cv.getBoundingClientRect();
+  const cx = (e.clientX - rect.left) / (rect.width / PX) / CELL;
+  const cy = (e.clientY - rect.top) / (rect.height / PX) / CELL;
+  let best = null, bd = 2.5;
+  for (const a of ambulances) {
+    const d = Math.hypot(a.x + 0.5 - cx, a.y + 0.5 - cy);
+    if (d < bd) { bd = d; best = { type: 'amb', obj: a }; }
+  }
+  for (const c of calls) {
+    const d = Math.hypot(c.x + 0.5 - cx, c.y + 0.5 - cy);
+    if (d < bd) { bd = d; best = { type: 'call', obj: c }; }
+  }
+  selected = best;
+});
+
+function renderInspector() {
+  const el = document.getElementById('insp');
+  if (!selected) { el.style.display = 'none'; return; }
+  let html = '';
+  if (selected.type === 'amb') {
+    const a = selected.obj;
+    if (!ambulances.includes(a)) { selected = null; el.style.display = 'none'; return; }
+    html = `<b>Бригада №${a.id}</b> · ${STATE_RU[a.state]}<br>
+            Позиция: клетка ${Math.round(a.x)},${Math.round(a.y)} · база: ${a.base.x},${a.base.y}`;
+    if (a.call) html += `<br>Вызов: P${a.call.pri} · район ${a.call.district}<br>
+            Прогресс маршрута: ${a.progress()}%`;
+    else html += `<br>Вызовов нет — на базе или в патруле`;
+  } else {
+    const c = selected.obj;
+    if (!calls.includes(c)) { selected = null; el.style.display = 'none'; return; }
+    html = `<b>Вызов P${c.pri}</b> · район ${c.district}<br>
+            Статус: ${c.status === 'waiting' ? 'ожидает бригаду' : 'назначен'}<br>
+            Время ожидания: ${(simTime - c.created).toFixed(1)} мин`;
+    if (c.amb) html += `<br>Бригада: №${c.amb.id} · путь пройден на ${c.amb.progress()}%`;
+    if (c.arrive != null) html += `<br>Прибытие через ${(c.arrive - c.created).toFixed(1)} мин после создания`;
+  }
+  el.innerHTML = html;
+  el.style.display = 'block';
+}
+
+// ================= СИМУЛЯЦИЯ =================
+function reset() {
+  rng = mulberry32(parseInt(document.getElementById('seed').value) || 42);
+  ambulances = []; calls = []; simTime = 0; nextCall = 0; nextReposition = 0;
+  metrics = { resp: [], resp1: [] };
+  selected = null;
+  // бригады распределяются по всем базам по кругу
+  const total = parseInt(document.getElementById('crews').value) || 16;
+  document.getElementById('lblCrew').textContent = total;
+  let id = 1;
+  for (let i = 0; i < total; i++) {
+    const [x, y] = HOSPITALS[i % HOSPITALS.length];
+    ambulances.push(new Ambulance(id++, {x, y}));
+  }
+  logEl.innerHTML = ''; log(`Стратегия: ${strategyRu()}, бригад: ${ambulances.length}`);
+}
+
+const strategyName = () =>
+  document.getElementById('strategy').value === 'greedy' ? 'greedy' : 'smart';
+const strategyRu = () =>
+  document.getElementById('strategy').value === 'greedy' ? 'Жадная' : 'Умная';
+
+function tick(dt) {
+  simTime += dt;
+  const rate = parseFloat(document.getElementById('rate').value);
+  document.getElementById('lblRate').textContent = rate.toFixed(1);
+  if (simTime >= nextCall) { calls.push(new Call(simTime)); nextCall = simTime - Math.log(rng() || 1e-9) / rate; }
+
+  const strat = document.getElementById('strategy').value;
+  strat === 'greedy' ? dispatchGreedy() : dispatchSmart();
+  if (strat === 'smart' && simTime >= nextReposition) {
+    nextReposition = simTime + 120; // патрулирование раз в 2 минуты
+    reposition();
+  }
+
+  for (const a of ambulances) a.step(dt);
+
+  for (const c of calls) if (c.status === 'assigned' && c.amb.state === 'atScene') {
+    c.wait -= dt;
+    if (c.wait <= 0) {
+      let best = HOSPITALS[0], bd = Infinity;
+      for (const [hx, hy] of HOSPITALS) {
+        const d = aStarLen([c.amb.x, c.amb.y], [hx, hy]);
+        if (d < bd) { bd = d; best = [hx, hy]; }
+      }
+      c.amb.state = 'toHosp';
+      c.amb.path = aStar([c.amb.x, c.amb.y], best);
+    }
+  }
+  calls = calls.filter(c => c.status !== 'done');
+  updateStats();
+}
+
+function updateStats() {
+  const avg = l => l.length ? (l.reduce((a, b) => a + b, 0) / l.length).toFixed(1) : '—';
+  document.getElementById('sAvg').textContent = avg(metrics.resp);
+  document.getElementById('sP1').textContent = avg(metrics.resp1);
+  document.getElementById('sDone').textContent = metrics.resp.length;
+  document.getElementById('sBusy').textContent = ambulances.filter(a => a.state !== 'idle' && a.state !== 'reposition').length;
+}
+
+function record() {
+  const avg = l => l.length ? +(l.reduce((a, b) => a + b, 0) / l.length).toFixed(1) : null;
+  const a1 = avg(metrics.resp), a2 = avg(metrics.resp1);
+  if (a1 == null) { log('Нечего фиксировать — ни один вызов ещё не обслужен'); return; }
+  records.push({
+    strategy: strategyName(),
+    seed: parseInt(document.getElementById('seed').value) || 42,
+    rate: +parseFloat(document.getElementById('rate').value).toFixed(1),
+    crews: +document.getElementById('crews').value,
+    avg: a1, avgP1: a2, n: metrics.resp.length, simTime
+  });
+  const row = document.createElement('tr');
+  row.innerHTML = `<td>${strategyRu()} · ${document.getElementById('rate').value} · ${document.getElementById('crews').value}бр</td><td>${a1}</td><td>${a2 ?? '—'}</td><td>${metrics.resp.length}</td>`;
+  document.getElementById('cmp').appendChild(row);
+  metrics = { resp: [], resp1: [] };
+  log(`Замер зафиксирован: ${strategyRu()}, ${document.getElementById('rate').value} выз./мин, ${document.getElementById('crews').value} бригад`);
+  drawChart();
+}
+
+// ================= РЕНДЕР =================
+function draw() {
+  ctx.fillStyle = '#0b1018'; ctx.fillRect(0, 0, PX, PX);
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) if (isRoad(x, y)) {
+    ctx.fillStyle = (x % 6 === 3 || y % 6 === 3) ? '#22304a' : '#161f2e';
+    ctx.fillRect(x * CELL, y * CELL, CELL, CELL);
+  }
+  ctx.fillStyle = '#334155'; ctx.font = '10px sans-serif';
+  for (const [x1, y1, x2, y2, name] of DISTRICTS) ctx.fillText(name, x1 * CELL + 4, y1 * CELL + 24);
+
+  for (const c of calls) {
+    const px = c.x * CELL + CELL / 2, py = c.y * CELL + CELL / 2;
+    if (selected && selected.type === 'call' && selected.obj === c) {
+      ctx.beginPath(); ctx.arc(px, py, 10, 0, 7);
+      ctx.strokeStyle = '#fff'; ctx.setLineDash([3, 3]); ctx.lineWidth = 1.5;
+      ctx.stroke(); ctx.setLineDash([]);
+    }
+    ctx.beginPath(); ctx.arc(px, py, c.pri === 1 ? 6 : 4, 0, 7);
+    ctx.fillStyle = c.pri === 1 ? '#fff' : (c.status === 'waiting' ? '#f87171' : '#a78bfa');
+    ctx.fill();
+    if (c.pri === 1 && c.status !== 'done') {
+      ctx.beginPath(); ctx.arc(px, py, 6 + 4 * Math.sin(Date.now() / 200), 0, 7);
+      ctx.strokeStyle = '#fff'; ctx.stroke();
+    }
+  }
+  for (const [x, y, name] of HOSPITALS) {
+    ctx.fillStyle = '#4ade80'; ctx.fillRect(x * CELL - 2, y * CELL - 2, CELL + 4, CELL + 4);
+    ctx.fillStyle = '#0b1018'; ctx.font = 'bold 9px sans-serif'; ctx.fillText('+', x * CELL + 2, y * CELL + 9);
+  }
+  for (const a of ambulances) {
+    const px = a.x * CELL + CELL / 2, py = a.y * CELL + CELL / 2;
+    if (selected && selected.type === 'amb' && selected.obj === a) {
+      ctx.beginPath(); ctx.arc(px, py, 11, 0, 7);
+      ctx.strokeStyle = '#fff'; ctx.setLineDash([3, 3]); ctx.lineWidth = 1.5;
+      ctx.stroke(); ctx.setLineDash([]);
+    }
+    const col = a.state === 'idle' ? '#2dd4bf'
+              : a.state === 'reposition' ? '#155e5a'
+              : a.state === 'toHosp' ? '#f87171' : '#fbbf24';
+    ctx.beginPath(); ctx.arc(px, py, 5, 0, 7);
+    ctx.fillStyle = col; ctx.fill();
+    ctx.fillStyle = '#04211d'; ctx.font = 'bold 7px sans-serif';
+    ctx.fillText(a.id, a.x * CELL + 2, a.y * CELL + 9);
+  }
+}
+
+// ================= ЦИКЛ =================
+let last = 0;
+function loop(t) {
+  const dt = Math.min((t - last) / 1000, 0.1); last = t;
+  if (running) for (let i = 0; i < 3; i++) tick(0.016 * 3);
+  draw();
+  renderInspector();
+  requestAnimationFrame(loop);
+}
+document.getElementById('btnRun').onclick = e => {
+  running = !running; e.target.textContent = running ? 'Пауза' : 'Пуск';
+};
+document.getElementById('btnReset').onclick = reset;
+document.getElementById('btnRestart').onclick = reset;
+document.getElementById('btnRecord').onclick = record;
+document.getElementById('btnExport').onclick = exportCSV;
+fitCanvas(); reset(); drawChart(); requestAnimationFrame(loop);
+</script>
+</body>
+</html>
